@@ -1,0 +1,7 @@
+# Place your documents here before running Phase 1 scripts.
+#
+# Recommended folder structure:
+#   docs/knowledge-base/
+#   ├── app-features/       ← feature guides, release notes
+#   ├── incident-history/   ← resolved incident reports (.md)
+#   └── runbooks/           ← SOPs, troubleshooting guides
