@@ -1,17 +1,18 @@
 """
 scripts/deploy.py
 
-Deploys the full Bedrock Support Chatbot CloudFormation stack.
-Replaces Phase 1 scripts (01–05) and Phase 2 setup scripts (06, 07, 09).
+Packages Lambda functions, uploads artifacts to S3, and deploys the
+CloudFormation stack. Equivalent to running scripts/deploy.sh.
 
 Usage:
   python scripts/deploy.py            # create or update stack
   python scripts/deploy.py --delete   # tear down everything
 """
 import argparse
+import io
 import json
 import os
-import sys
+import zipfile
 from pathlib import Path
 
 import boto3
@@ -20,18 +21,27 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-ROOT       = Path(__file__).parent.parent
-TEMPLATE   = ROOT / "infra" / "cloudformation" / "template.yml"
-IDS_FILE   = ROOT / "bedrock_ids.json"
-STACK_NAME = "bedrock-support-chatbot"
-REGION     = os.getenv("AWS_REGION", "us-east-1")
+ROOT             = Path(__file__).parent.parent
+TEMPLATE         = ROOT / "infra" / "cloudformation" / "template.yml"
+LAMBDA_DIR       = ROOT / "lambda"
+IDS_FILE         = ROOT / "bedrock_ids.json"
+STACK_NAME       = "bedrock-support-chatbot"
+REGION           = os.getenv("AWS_REGION", "us-east-1")
 
 
 def _session():
     return boto3.session.Session(region_name=REGION)
 
 
-def _load_ids():
+def _account_id(sess) -> str:
+    return sess.client("sts").get_caller_identity()["Account"]
+
+
+def _artifacts_bucket(account_id: str) -> str:
+    return os.getenv("ARTIFACTS_BUCKET", f"cf-artifacts-{account_id}-{REGION}")
+
+
+def _load_ids() -> dict:
     return json.loads(IDS_FILE.read_text()) if IDS_FILE.exists() else {}
 
 
@@ -43,21 +53,67 @@ def _save_ids(data: dict):
 
 
 def _read_instruction() -> str:
-    path = ROOT / "bedrock" / "instruction.txt"
-    return path.read_text().strip()
+    return (ROOT / "bedrock" / "instruction.txt").read_text().strip()
 
+
+# ── Lambda packaging ──────────────────────────────────────────────────────────
+
+def _zip_file(py_path: Path) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(py_path, py_path.name)
+    return buf.getvalue()
+
+
+def _ensure_bucket(s3, bucket: str):
+    try:
+        s3.head_bucket(Bucket=bucket)
+    except ClientError:
+        kwargs = {"Bucket": bucket}
+        if REGION != "us-east-1":
+            kwargs["CreateBucketConfiguration"] = {"LocationConstraint": REGION}
+        s3.create_bucket(**kwargs)
+        print(f"Created artifacts bucket: {bucket}")
+
+
+def _upload_lambdas(s3, bucket: str):
+    handlers = [
+        (LAMBDA_DIR / "chatbot_handler.py",    "lambda/chatbot.zip"),
+        (LAMBDA_DIR / "ingest_handler.py",     "lambda/ingest.zip"),
+        (LAMBDA_DIR / "aoss_index_creator.py", "lambda/aoss_index_creator.zip"),
+    ]
+    for src, key in handlers:
+        s3.put_object(Bucket=bucket, Key=key, Body=_zip_file(src))
+        print(f"  Uploaded {src.name} → s3://{bucket}/{key}")
+
+
+# ── CloudFormation deploy ─────────────────────────────────────────────────────
 
 def deploy():
     sess    = _session()
-    cf      = sess.client("cloudformation")
     s3      = sess.client("s3")
+    cf      = sess.client("cloudformation")
     bedrock = sess.client("bedrock-agent")
 
+    account_id      = _account_id(sess)
+    artifacts_bucket = _artifacts_bucket(account_id)
+
+    # Step 1 — artifacts bucket
+    print("[1/5] Ensuring artifacts bucket…")
+    _ensure_bucket(s3, artifacts_bucket)
+
+    # Step 2 — package and upload Lambda zips
+    print("[2/5] Packaging and uploading Lambda functions…")
+    _upload_lambdas(s3, artifacts_bucket)
+
+    # Step 3 — deploy CF stack
+    print("[3/5] Deploying CloudFormation stack…")
     template_body = TEMPLATE.read_text()
     params = [
-        {"ParameterKey": "S3BucketName",     "ParameterValue": os.getenv("S3_BUCKET_NAME", "prod-support-kb-docs")},
-        {"ParameterKey": "AgentInstruction",  "ParameterValue": _read_instruction()},
-        {"ParameterKey": "SNSAlertsArn",      "ParameterValue": os.getenv("SNS_ALERTS_ARN", "")},
+        {"ParameterKey": "S3BucketName",    "ParameterValue": os.getenv("S3_BUCKET_NAME", "prod-support-kb-docs")},
+        {"ParameterKey": "ArtifactsBucket", "ParameterValue": artifacts_bucket},
+        {"ParameterKey": "AgentInstruction","ParameterValue": _read_instruction()},
+        {"ParameterKey": "SNSAlertsArn",    "ParameterValue": os.getenv("SNS_ALERTS_ARN", "")},
     ]
     common = dict(
         StackName=STACK_NAME,
@@ -76,29 +132,29 @@ def deploy():
     if stack_exists:
         try:
             cf.update_stack(**common)
-            print("Updating stack…")
+            print("  Updating stack…")
             waiter = cf.get_waiter("stack_update_complete")
-        except ClientError as e:
-            if "No updates are to be performed" in str(e):
-                print("Stack is already up to date.")
+        except ClientError as exc:
+            if "No updates are to be performed" in str(exc):
+                print("  Stack is already up to date.")
                 _post_deploy(cf, s3, bedrock)
                 return
             raise
     else:
         cf.create_stack(**common, OnFailure="ROLLBACK")
-        print("Creating stack…")
+        print("  Creating stack (10–20 min first time)…")
         waiter = cf.get_waiter("stack_create_complete")
 
-    print("Waiting for stack to stabilise (this can take 10–20 min for first deploy)…")
     waiter.wait(StackName=STACK_NAME, WaiterConfig={"Delay": 30, "MaxAttempts": 120})
-    print("Stack deployed successfully.")
+    print("  Stack deployed successfully.")
     _post_deploy(cf, s3, bedrock)
 
 
 def _post_deploy(cf, s3, bedrock):
+    # Step 4 — save outputs
+    print("[4/5] Saving stack outputs…")
     stack   = cf.describe_stacks(StackName=STACK_NAME)["Stacks"][0]
     outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
-
     _save_ids({
         "api_endpoint": outputs.get("ApiEndpoint"),
         "kb_id":        outputs.get("KnowledgeBaseId"),
@@ -108,13 +164,11 @@ def _post_deploy(cf, s3, bedrock):
         "bucket":       outputs.get("BucketName"),
     })
 
+    # Step 5 — upload docs + trigger ingestion
+    print("[5/5] Uploading knowledge-base documents…")
     bucket = outputs.get("BucketName", os.getenv("S3_BUCKET_NAME", "prod-support-kb-docs"))
     _upload_docs(s3, bucket)
-
-    kb_id = outputs.get("KnowledgeBaseId")
-    ds_id = outputs.get("DataSourceId")
-    if kb_id and ds_id:
-        _trigger_ingestion(bedrock, kb_id, ds_id)
+    _trigger_ingestion(bedrock, outputs.get("KnowledgeBaseId"), outputs.get("DataSourceId"))
 
     print(f"\nChatbot endpoint: {outputs.get('ApiEndpoint')}")
     print("Test it:")
@@ -133,28 +187,29 @@ def _upload_docs(s3, bucket: str):
             s3.upload_file(str(path), bucket, key)
             count += 1
     if count:
-        print(f"Uploaded {count} document(s) to s3://{bucket}/")
+        print(f"  Uploaded {count} document(s) to s3://{bucket}/")
 
 
 def _trigger_ingestion(bedrock, kb_id: str, ds_id: str):
+    if not kb_id or not ds_id:
+        return
     running = bedrock.list_ingestion_jobs(
         knowledgeBaseId=kb_id,
         dataSourceId=ds_id,
         filters=[{"attribute": "STATUS", "operator": "EQ", "values": ["IN_PROGRESS", "STARTING"]}],
     )["ingestionJobSummaries"]
     if running:
-        print("Ingestion already running.")
+        print("  Ingestion already running.")
         return
     job    = bedrock.start_ingestion_job(knowledgeBaseId=kb_id, dataSourceId=ds_id)
     job_id = job["ingestionJob"]["ingestionJobId"]
-    print(f"Started initial ingestion job: {job_id}")
-    print("Ingestion runs in the background (~5–15 min). Monitor in the Bedrock console.")
+    print(f"  Started ingestion job {job_id} (runs ~5–15 min in background).")
 
 
 def delete():
     cf = _session().client("cloudformation")
     cf.delete_stack(StackName=STACK_NAME)
-    print("Deleting stack… (this may take several minutes)")
+    print("Deleting stack…")
     cf.get_waiter("stack_delete_complete").wait(
         StackName=STACK_NAME, WaiterConfig={"Delay": 30, "MaxAttempts": 60}
     )
@@ -163,7 +218,7 @@ def delete():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Deploy the Bedrock Support Chatbot stack")
-    parser.add_argument("--delete", action="store_true", help="Tear down the CloudFormation stack")
+    parser.add_argument("--delete", action="store_true", help="Delete the CloudFormation stack")
     args = parser.parse_args()
 
     if args.delete:
